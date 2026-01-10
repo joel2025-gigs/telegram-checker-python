@@ -1,105 +1,123 @@
 from flask import Flask, request, jsonify
 from telethon.sync import TelegramClient
-from telethon.sessions import StringSession
 from telethon.tl.types import InputPhoneContact
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
-import os
+from telethon.errors import FloodWaitError
+import asyncio
+import time
 
 app = Flask(__name__)
 
-@app.route('/check', methods=['POST', 'OPTIONS'])
-def check_phones():
-    if request.method == 'OPTIONS':
-        return '', 200, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type'
-        }
+BATCH_SIZE = 50  # Process 50 contacts at a time
+BATCH_DELAY = 2  # Wait 2 seconds between batches
 
-    data = request.get_json()
-    phone_numbers = data.get('phoneNumbers', [])
-
-    api_id = data.get('apiId') or os.environ.get('TELEGRAM_API_ID')
-    api_hash = data.get('apiHash') or os.environ.get('TELEGRAM_API_HASH')
-    session_string = data.get('sessionString') or os.environ.get('TELEGRAM_SESSION_STRING')
-
-    if not all([api_id, api_hash, session_string]):
-        return jsonify({'error': 'Missing Telegram credentials'}), 400
-
+async def check_phones_batch(client, phone_numbers):
     results = []
-
-    try:
-        client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
-        client.connect()
-
-        for phone in phone_numbers:
-            try:
-                result = client(ImportContactsRequest(
-                    contacts=[InputPhoneContact(
-                        client_id=0,
-                        phone=phone,
-                        first_name="Check",
-                        last_name=""
-                    )]
-                ))
-
-                if result.users:
-                    user = result.users[0]
-                    last_seen = "unknown"
-                    last_seen_days = None
-
-                    if hasattr(user, 'status') and user.status:
-                        status_type = type(user.status).__name__
-                        if 'Recently' in status_type:
-                            last_seen = "recently"
-                            last_seen_days = 0
-                        elif 'Week' in status_type:
-                            last_seen = "within_week"
-                            last_seen_days = 5
-                        elif 'Month' in status_type:
-                            last_seen = "within_month"
-                            last_seen_days = 20
-                        elif 'Long' in status_type:
-                            last_seen = "long_ago"
-                            last_seen_days = 90
-
+    
+    for i in range(0, len(phone_numbers), BATCH_SIZE):
+        batch = phone_numbers[i:i + BATCH_SIZE]
+        print(f"Processing batch {i // BATCH_SIZE + 1}: {len(batch)} numbers")
+        
+        try:
+            contacts = [
+                InputPhoneContact(
+                    client_id=idx,
+                    phone=phone,
+                    first_name=f"Check{idx}",
+                    last_name=""
+                )
+                for idx, phone in enumerate(batch)
+            ]
+            
+            result = await client(ImportContactsRequest(contacts))
+            
+            # Map imported users
+            imported_phones = {}
+            for user in result.users:
+                if user.phone:
+                    imported_phones[f"+{user.phone}"] = user
+            
+            # Build results for this batch
+            for phone in batch:
+                normalized = phone if phone.startswith('+') else f'+{phone}'
+                if normalized in imported_phones or phone in imported_phones:
+                    user = imported_phones.get(normalized) or imported_phones.get(phone)
                     results.append({
-                        'phoneNumber': phone,
-                        'status': 'found',
-                        'username': user.username,
-                        'displayName': f"{user.first_name or ''} {user.last_name or ''}".strip(),
-                        'userId': str(user.id),
-                        'lastSeen': last_seen,
-                        'lastSeenDays': last_seen_days
+                        "phoneNumber": phone,
+                        "status": "found",
+                        "userId": str(user.id),
+                        "username": user.username,
+                        "displayName": f"{user.first_name or ''} {user.last_name or ''}".strip()
                     })
-
-                    # Clean up - delete the contact
-                    client(DeleteContactsRequest(id=[user.id]))
                 else:
                     results.append({
-                        'phoneNumber': phone,
-                        'status': 'not_found'
+                        "phoneNumber": phone,
+                        "status": "not_found"
                     })
-            except Exception as e:
-                results.append({
-                    'phoneNumber': phone,
-                    'status': 'error',
-                    'error': str(e)
-                })
+            
+            # Delete contacts to clean up
+            if result.users:
+                await client(DeleteContactsRequest(id=[u.id for u in result.users]))
+            
+            # Delay between batches
+            if i + BATCH_SIZE < len(phone_numbers):
+                await asyncio.sleep(BATCH_DELAY)
+                
+        except FloodWaitError as e:
+            print(f"Rate limited! Waiting {e.seconds} seconds...")
+            # For remaining numbers in this batch, mark as rate-limited
+            for phone in batch:
+                if not any(r['phoneNumber'] == phone for r in results):
+                    results.append({
+                        "phoneNumber": phone,
+                        "status": "error",
+                        "error": f"Rate limited. Try again in {e.seconds} seconds."
+                    })
+            # Wait the required time, then continue
+            await asyncio.sleep(min(e.seconds, 30))  # Cap at 30 seconds
+            
+        except Exception as e:
+            print(f"Batch error: {e}")
+            for phone in batch:
+                if not any(r['phoneNumber'] == phone for r in results):
+                    results.append({
+                        "phoneNumber": phone,
+                        "status": "error", 
+                        "error": str(e)
+                    })
+    
+    return results
 
-        client.disconnect()
-
+@app.route('/check', methods=['POST'])
+def check():
+    data = request.json
+    phone_numbers = data.get('phoneNumbers', [])
+    api_id = data.get('apiId')
+    api_hash = data.get('apiHash')
+    session_string = data.get('sessionString')
+    
+    if not all([phone_numbers, api_id, api_hash, session_string]):
+        return jsonify({"error": "Missing required fields"}), 400
+    
+    try:
+        from telethon.sessions import StringSession
+        
+        async def run():
+            client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                return {"error": "Session not authorized"}
+            
+            results = await check_phones_batch(client, phone_numbers)
+            await client.disconnect()
+            return {"results": results}
+        
+        result = asyncio.run(run())
+        return jsonify(result)
+        
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-    response = jsonify({'results': results})
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    return response
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=5000)
